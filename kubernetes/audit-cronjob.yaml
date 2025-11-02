@@ -1,0 +1,20 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: cluster-audit-hourly
+spec:
+  schedule: "0 * * * *"
+  successfulJobsHistoryLimit: 2
+  failedJobsHistoryLimit: 2
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: default
+          containers:
+            - name: cluster-audit
+              image: REPLACE_WITH_REGISTRY/cluster-audit:latest
+              env:
+                - name: OUT_DIR
+                  value: /tmp/output
+          restartPolicy: Never
