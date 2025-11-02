@@ -1,0 +1,224 @@
+name: MLOps Takehome CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "infra action: plan/apply/destroy or deploy"
+        required: true
+        default: "plan"
+        type: choice
+        options: ["plan","apply","destroy","deploy"]
+      env:
+        description: "environment"
+        required: true
+        default: "dev"
+        type: choice
+        options: ["dev","stg","prod"]
+
+env:
+  TF_WORKING_DIR: terraform/kubernetes
+  REGION: us-east-1
+  ECR_REPO: cluster-audit
+  CLUSTER_NAME_PREFIX: mlops-platform
+  PY_VERSION: "3.11"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  validate:
+    name: Validate (fmt/validate + bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PY_VERSION }}
+
+      - name: Install bandit
+        run: pip install bandit==1.7.9
+
+      - name: Bandit scan (src + scripts)
+        run: |
+          bandit -r src || true
+          bandit -r scripts || true
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Terraform fmt
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform init (local backend)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform validate
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform validate
+
+  plan:
+    name: Terraform plan (all envs)
+    runs-on: ubuntu-latest
+    needs: validate
+    strategy:
+      matrix:
+        env: [dev, stg, prod]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        # You can switch to OIDC role if preferred; this uses keys in repo secrets for simplicity
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform plan (${{ matrix.env }})
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -var-file="envs/${{ matrix.env }}.tfvars" -out="${{ matrix.env }}.tfplan"
+
+      - name: Upload plan artifact (${{ matrix.env }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ matrix.env }}
+          path: ${{ env.TF_WORKING_DIR }}/${{ matrix.env }}.tfplan
+
+  apply:
+    name: Terraform apply (manual)
+    runs-on: ubuntu-latest
+    needs: plan
+    if: ${{ github.event.inputs.action == 'apply' }}
+    environment:
+      name: ${{ github.event.inputs.env }}
+      # protect this environment in GitHub for manual approval if desired
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform plan (fresh for apply)
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform plan -var-file="envs/${{ github.event.inputs.env }}.tfvars" -out="toapply.tfplan"
+
+      - name: Terraform apply
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform apply -auto-approve "toapply.tfplan"
+
+      - name: Save TF outputs (cluster info)
+        id: tfout
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: |
+          echo "endpoint=$(terraform output -raw cluster_endpoint || true)" >> $GITHUB_OUTPUT
+          echo "name=$(terraform output -raw cluster_name || true)" >> $GITHUB_OUTPUT
+          echo "oidc=$(terraform output -raw cluster_oidc_issuer || true)" >> $GITHUB_OUTPUT
+
+  destroy:
+    name: Terraform destroy (manual)
+    runs-on: ubuntu-latest
+    needs: plan
+    if: ${{ github.event.inputs.action == 'destroy' }}
+    environment:
+      name: ${{ github.event.inputs.env }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.REGION }}
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.5.7
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform init
+
+      - name: Terraform destroy
+        working-directory: ${{ env.TF_WORKING_DIR }}
+        run: terraform destroy -auto-approve -var-file="envs/${{ github.event.inputs.env }}.tfvars"
+
+  deploy:
+    name: Build & Deploy (container + k8s)
+    runs-on: ubuntu-latest
+    needs: apply
+    if: ${{ github.event.inputs.action == 'deploy' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.REGION }}
+
+      - name: ECR login
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: 'true'
+
+      - name: Buildx set up
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push image (linux/amd64)
+        run: |
+          REPO_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.REGION }}.amazonaws.com/${{ env.ECR_REPO }}"
+          docker buildx build --platform linux/amd64 -t "$REPO_URI:latest" --push .
+
+      - name: Update kubeconfig (dev cluster by default)
+        run: |
+          CLUSTER="${{ env.CLUSTER_NAME_PREFIX }}-${{ github.event.inputs.env }}-eks"
+          aws eks update-kubeconfig --name "$CLUSTER" --region ${{ env.REGION }}
+
+      - name: Deploy Job & CronJob
+        run: |
+          REPO_URI="${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ env.REGION }}.amazonaws.com/${{ env.ECR_REPO }}"
+          # service account / rbac (idempotent)
+          kubectl apply -f kubernetes/rbac/cluster-audit-rbac.yaml
+          # Job
+          sed "s#REPLACE_WITH_REGISTRY/cluster-audit:latest#$REPO_URI:latest#g" kubernetes/audit-job.yaml | kubectl apply -f -
+          # CronJob
+          sed "s#REPLACE_WITH_REGISTRY/cluster-audit:latest#$REPO_URI:latest#g" kubernetes/audit-cronjob.yaml | kubectl apply -f -
+          kubectl get nodes -o wide
+          kubectl get jobs,cronjobs -A
