@@ -14,6 +14,24 @@ The objective of this assessment is to:
 
 ---
 
+## 🧩 Architecture Overview
+
+```
+Developer → GitHub Actions → Terraform (EKS) → ECR → EKS Cluster
+                               │
+                               ├── EKS Nodes run cluster-audit job
+                               │
+                               └── CronJob schedules periodic audits
+```
+
+**Core Components:**
+- **Terraform** — Provisions multi-environment Kubernetes (EKS).
+- **ECR** — Stores container images for the cluster.
+- **Kubernetes CronJob** — Runs hourly to audit and log cluster state.
+- **GitHub Actions** — Manages CI/CD pipeline for Terraform + Docker + K8s deploy.
+
+---
+
 ## 🗂️ Repository Structure
 
 ```bash
@@ -25,7 +43,8 @@ The objective of this assessment is to:
 │       └── cicd.yml
 ├── kubernetes/
 │   ├── audit-job.yaml
-│   └── audit-cronjob.yaml
+│   ├── audit-cronjob.yaml
+│   └── rbac.yaml
 ├── output/
 │   └── .gitkeep
 ├── scripts/
@@ -57,31 +76,142 @@ The objective of this assessment is to:
 
 ---
 
-## ⚙️ scripts/
+## ⚙️ Setup Instructions
 
-| Script | Purpose | Usage |
-|---------|----------|--------|
-| `kubeconfig_from_eks.sh` | Generate kubeconfig for EKS | `./scripts/kubeconfig_from_eks.sh <cluster> <region> <output-file>` |
-| `tf_init_plan_apply.sh` | (Optional) Local Terraform automation | For local debugging |
-| `tf_destroy.sh` | (Optional) Destroy Terraform-managed resources | For cleanup |
+### 1️⃣ Clone and Initialize
+```bash
+git clone https://github.com/<your-org>/mlops-takehome.git
+cd mlops-takehome
+```
 
-> Only `kubeconfig_from_eks.sh` is typically required for standard operations.
+### 2️⃣ Terraform — Provision Cluster
+```bash
+cd terraform/kubernetes
+terraform init
+terraform plan -var-file="envs/dev.tfvars"
+terraform apply -auto-approve
+```
+
+### 3️⃣ Configure Kubectl
+```bash
+./scripts/kubeconfig_from_eks.sh <cluster_name> <region> kubeconfig
+export KUBECONFIG=$(pwd)/kubeconfig
+```
+
+### 4️⃣ Build & Push Docker Image
+```bash
+REGION=us-east-1
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+REPO_URI="$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com/cluster-audit"
+
+docker buildx build   --platform linux/amd64   -t "$REPO_URI:latest"   --push .
+```
+
+### 5️⃣ Deploy the CronJob
+```bash
+kubectl apply -f kubernetes/audit-cronjob.yaml
+kubectl get pods
+kubectl logs -l job-name=cluster-audit --tail=50
+```
 
 ---
 
-## ⚡ GitHub Actions CI/CD
+## 💡 Usage Examples
+
+### Run Audit On-Demand
+```bash
+kubectl apply -f kubernetes/audit-job.yaml
+kubectl logs -l job-name=cluster-audit
+```
+
+### Verify Audit Output
+```bash
+kubectl get pods
+kubectl cp <pod_name>:/output ./output
+cat ./output/cluster_audit_<timestamp>.json
+```
+
+---
+
+## 🧰 Troubleshooting Guide
+
+| Issue | Possible Cause | Resolution |
+|-------|----------------|-------------|
+| **`ErrImagePull`** | Image not found in ECR | Ensure ECR repo exists and image tag pushed correctly |
+| **`Forbidden` error (403)** | ServiceAccount lacks RBAC | Apply `kubernetes/rbac.yaml` to grant access |
+| **Pod stuck in `Pending`** | Node resources exhausted | Check node group scaling, retry job |
+| **Terraform state conflict** | Locked backend | Release DynamoDB state lock or re-init |
+
+---
+
+## ⚡ GitHub Actions CI/CD Workflow
 
 Located at `.github/workflows/cicd.yml`
 
-### Pipeline Stages
-1. **Terraform Apply**
-2. **Build & Push Docker Image**
-3. **Deploy to EKS**
-4. **Verify Job Logs**
+### Stages
+1. **Terraform Init & Apply**
+2. **Docker Build & ECR Push**
+3. **Kubernetes Deploy**
+4. **Job Verification via kubectl logs**
 
-### Trigger:
-- On push or PR to `main`
-- Manual trigger (`workflow_dispatch`)
+Triggered on:
+- Push to `main`
+- Manual `workflow_dispatch`
+
+---
+
+## 📁 Example terraform.tfvars Files
+
+### `dev.tfvars`
+```hcl
+environment = "dev"
+region      = "us-east-1"
+cluster_name = "eks-dev-cluster"
+node_instance_type = "t3.medium"
+desired_capacity = 2
+```
+
+### `stg.tfvars`
+```hcl
+environment = "stg"
+region      = "us-east-1"
+cluster_name = "eks-stg-cluster"
+node_instance_type = "t3.large"
+desired_capacity = 3
+```
+
+### `prod.tfvars`
+```hcl
+environment = "prod"
+region      = "us-east-1"
+cluster_name = "eks-prod-cluster"
+node_instance_type = "m5.large"
+desired_capacity = 4
+```
+
+---
+
+## 🔍 Sample kubectl Verification Commands
+
+```bash
+kubectl get nodes -o wide
+kubectl get pods -A
+kubectl get jobs -A
+kubectl describe job cluster-audit
+kubectl logs -l job-name=cluster-audit
+kubectl get cronjobs
+kubectl get events --sort-by=.metadata.creationTimestamp | tail -20
+```
+
+---
+
+## 🧠 Design Decisions & Assumptions
+
+- **Multi-Environment Support:** Terraform is modular, supporting `dev`, `stg`, and `prod` via `tfvars`.
+- **Security:** Uses RBAC and ECR-based private image access.
+- **Portability:** Uses `docker buildx` to ensure cross-platform builds (`linux/amd64`).
+- **Resilience:** The CronJob is idempotent — completed pods terminate cleanly.
+- **Observability:** Logs are written to `/output` and can be exported to CloudWatch in future enhancements.
 
 ---
 
@@ -109,15 +239,5 @@ __pycache__/
 .vscode/
 .idea/
 ```
-
----
-
-## 🏁 Deliverables Checklist
-
-✅ EKS cluster deployed via Terraform  
-✅ ECR image built & pushed  
-✅ Cluster-audit CronJob runs hourly  
-✅ Logs and JSON audit output generated  
-✅ CI/CD workflow integrated
 
 ---
