@@ -1,130 +1,123 @@
-<<<<<<< HEAD
-# Senior MLOps Take-home – EKS, CI/CD, Kubernetes Audit
+# 🧭 MLOps Take-Home Assessment — Cluster Audit Automation
 
-This repo delivers a reusable EKS Terraform module for **dev/stg/prod**, a GitLab CI pipeline, and a Python-based **cluster audit** container deployed as a CronJob.
-
-## Contents
-- `terraform/kubernetes`: Root Terraform for EKS
-- `terraform/kubernetes/modules/eks-cluster`: Reusable module (VPC, subnets, NAT, IAM, SG, EKS + NodeGroups, logging)
-- `src/cluster_audit`: Python audit tool (lists nodes, pods, warnings → JSON)
-- `kubernetes/`: Job + CronJob manifests for the audit image
-- `.gitlab-ci.yml`: Validate → Plan → Apply/Destroy → Build/Push → Deploy
-- `scripts/`: Helper scripts
-- `output/`: Local audit output
+This project provisions an **Amazon EKS cluster** using Terraform, builds and pushes a custom **cluster audit image** to **Amazon ECR**, and deploys a **Kubernetes CronJob** that periodically audits the cluster and stores the output.
 
 ---
 
-## Architecture Overview
+## 🏗️ Project Overview
 
-**Networking**
-- Single VPC with **public** and **private** subnets across AZs
-- IGW + NAT GW, public RT for Internet egress, private RT via NAT
-
-**Security**
-- Separate SG for cluster and nodes
-- Node SG allows east-west inside VPC, egress to Internet
-
-**IAM**
-- Cluster role: `AmazonEKSClusterPolicy`, `AmazonEKSVpcResourceController`
-- Node role: `AmazonEKSWorkerNodePolicy`, `AmazonEC2ContainerRegistryReadOnly`, `AmazonEKS_CNI_Policy`
-- OIDC provider created for future IRSA
-
-**EKS**
-- Control plane logs enabled by default
-- Managed Node Groups per environment (size & instance types configurable)
-
-**Audit**
-- Python container lists cluster state and writes a timestamped JSON report.
-- Run as a **CronJob** hourly or as an ad-hoc **Job**.
+The objective of this assessment is to:
+1. Provision an EKS cluster via Terraform.
+2. Build and publish the **cluster-audit** container image to ECR.
+3. Deploy a **Kubernetes Job / CronJob** that audits cluster resources (nodes, pods, namespaces, etc.) and writes results to `/output`.
+4. Integrate the entire workflow via **GitHub Actions** for automated CI/CD.
 
 ---
 
-## Prerequisites
-
-- Terraform ≥ 1.6
-- AWS credentials with permissions for VPC/EKS/IAM if you plan to `apply`
-- `kubectl` (optional for local verification and audit deployment)
-- (Optional for CI) GitLab project & container registry
-
-> Note: The AWS provider block includes mock creds to allow `terraform validate/plan` without real AWS creds. For actual `apply`, export valid AWS credentials and (optionally) edit `providers.tf` to remove mock values.
-
----
-
-## Quickstart (Local)
+## 🗂️ Repository Structure
 
 ```bash
-# 1) Enter terraform root
-cd terraform/kubernetes
-
-# 2) Initialize and validate
-terraform init
-terraform validate
-
-# 3) Plan for dev
-terraform plan -var-file="envs/dev.tfvars" -out dev.tfplan
-
-# 4) Apply (requires working AWS credentials)
-terraform apply dev.tfplan
-```
-
-### Get kubeconfig & verify
-```bash
-../../scripts/kubeconfig_from_eks.sh mlops-platform-dev-eks us-east-1 kubeconfig
-export KUBECONFIG=$(pwd)/kubeconfig
-kubectl get nodes -o wide
-```
-
-### Run audit as a Job or CronJob
-- Build locally:
-```bash
-docker build -t cluster-audit:local .
-kubectl apply -f kubernetes/audit-job.yaml
-kubectl logs -l job-name=cluster-audit --all-containers
-```
-- Or schedule hourly:
-```bash
-kubectl apply -f kubernetes/audit-cronjob.yaml
+.
+├── Dockerfile
+├── README.md
+├── .github/
+│   └── workflows/
+│       └── cicd.yml
+├── kubernetes/
+│   ├── audit-job.yaml
+│   └── audit-cronjob.yaml
+├── output/
+│   └── .gitkeep
+├── scripts/
+│   ├── kubeconfig_from_eks.sh
+│   ├── tf_init_plan_apply.sh
+│   └── tf_destroy.sh
+├── src/
+│   └── cluster_audit/
+│       ├── cluster_audit.py
+│       └── requirements.txt
+└── terraform/
+    └── kubernetes/
+        ├── backend.tf
+        ├── main.tf
+        ├── providers.tf
+        ├── variables.tf
+        ├── versions.tf
+        ├── outputs.tf
+        ├── envs/
+        │   ├── dev.tfvars
+        │   ├── stg.tfvars
+        │   └── prod.tfvars
+        └── modules/
+            └── eks-cluster/
+                ├── main.tf
+                ├── outputs.tf
+                └── variables.tf
 ```
 
 ---
 
-## CI/CD (GitLab)
+## ⚙️ scripts/
 
-**Stages**
-1. **Validate**: Terraform fmt/validate; Python security scan (bandit)
-2. **Test**: Terraform plan for dev/stg/prod
-3. **Infrastructure**: manual `apply` and `destroy` (requires `TARGET_ENV` variable)
-4. **Deploy**: Build/push `cluster_audit` image; optional manual K8s deploy using a base64 kubeconfig
+| Script | Purpose | Usage |
+|---------|----------|--------|
+| `kubeconfig_from_eks.sh` | Generate kubeconfig for EKS | `./scripts/kubeconfig_from_eks.sh <cluster> <region> <output-file>` |
+| `tf_init_plan_apply.sh` | (Optional) Local Terraform automation | For local debugging |
+| `tf_destroy.sh` | (Optional) Destroy Terraform-managed resources | For cleanup |
 
-**Required CI variables**
-- `CI_REGISTRY_USER`, `CI_REGISTRY_PASSWORD`
-- `KUBECONFIG_B64` (optional, for deploy stage)
+> Only `kubeconfig_from_eks.sh` is typically required for standard operations.
 
 ---
 
-## Example kubectl commands for verification
+## ⚡ GitHub Actions CI/CD
 
-```bash
-kubectl get nodes
-kubectl get pods -A
-kubectl get events -A --sort-by=.lastTimestamp | tail -n 20
+Located at `.github/workflows/cicd.yml`
+
+### Pipeline Stages
+1. **Terraform Apply**
+2. **Build & Push Docker Image**
+3. **Deploy to EKS**
+4. **Verify Job Logs**
+
+### Trigger:
+- On push or PR to `main`
+- Manual trigger (`workflow_dispatch`)
+
+---
+
+## 🧾 .gitignore Recommendations
+
+```gitignore
+# Terraform
+*.tfstate
+*.tfstate.backup
+*.tfplan
+
+# Output
+/output/*
+!output/.gitkeep
+
+# kubeconfig
+terraform/kubernetes/kubeconfig
+
+# Python cache
+__pycache__/
+*.pyc
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
 ```
 
 ---
 
-## Assumptions & Design Decisions
+## 🏁 Deliverables Checklist
 
-- Opinionated but production-style VPC + EKS layout that’s easy to extend.
-- Node groups on private subnets.
-- Control plane logging on for observability.
-- Reusable module to drive dev/stg/prod via `*.tfvars`.
+✅ EKS cluster deployed via Terraform  
+✅ ECR image built & pushed  
+✅ Cluster-audit CronJob runs hourly  
+✅ Logs and JSON audit output generated  
+✅ CI/CD workflow integrated
 
 ---
-
-## Submission
-
-Create a **public** repo (GitLab preferred). Push these files, then email the repo link to:
-`DL-DPDATA-DataScience-ML-Ops@charter.com`.
-=======
-# initial page
->>>>>>> db0f8e70fe8bc82d621de040db42b6b2d23a6fbe
